@@ -78,6 +78,7 @@ private const val MaxStationNameLength = 48
 class MainActivity : ComponentActivity() {
     private lateinit var repository: StationRepository
     private var station by mutableStateOf<Station?>(null)
+    private var callRoute by mutableStateOf(CallRoute.UNAVAILABLE)
     private var handoffError by mutableStateOf<CallHandoffResult?>(null)
     private var shortcutNeedsSetup by mutableStateOf(false)
 
@@ -86,6 +87,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         repository = StationRepository(this)
         station = repository.load()
+        refreshCallRoute()
         readShortcutResult(intent)
 
         setContent {
@@ -102,10 +104,11 @@ class MainActivity : ComponentActivity() {
                     canPinShortcut = StationShortcut.isSupported(this),
                     shortcutNeedsSetup = shortcutNeedsSetup,
                     onShortcutSetupOpened = { shortcutNeedsSetup = false },
-                    onCall = { station?.let(::callStation) },
+                    onCall = ::callStation,
                     onSaveStation = { saved ->
                         repository.save(saved)
                         station = saved
+                        refreshCallRoute()
                     },
                     onPinShortcut = {
                         val message = if (StationShortcut.requestPin(this)) {
@@ -123,6 +126,11 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshCallRoute()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -143,8 +151,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun callStation(station: Station) {
-        val result = StationCall.launch(this, station.deviceId)
+    private fun refreshCallRoute() {
+        callRoute = StationCall.route(this, station?.deviceId)
+    }
+
+    private fun callStation() {
+        val result = StationCall.launch(this, station?.deviceId)
         if (result != CallHandoffResult.OPENED) handoffError = result
     }
 
@@ -170,6 +182,13 @@ class MainActivity : ComponentActivity() {
         onWidgetHelp: () -> Unit,
     ) {
         var showSettings by rememberSaveable { mutableStateOf(false) }
+        val route = callRoute
+        val configured = station?.deviceId != null
+        val onPrimary: () -> Unit = if (route == CallRoute.DIRECT && !configured) {
+            { showSettings = true }
+        } else {
+            onCall
+        }
         LaunchedEffect(shortcutNeedsSetup) {
             if (shortcutNeedsSetup) {
                 showSettings = true
@@ -213,10 +232,12 @@ class MainActivity : ComponentActivity() {
                                 StationTitle(station)
                                 Spacer(Modifier.height(28.dp))
                                 StationActions(
-                                    configured = station != null,
+                                    route = route,
+                                    configured = configured,
                                     canPinShortcut = canPinShortcut,
-                                    onPrimary = if (station == null) ({ showSettings = true }) else onCall,
+                                    onPrimary = onPrimary,
                                     onPinShortcut = onPinShortcut,
+                                    onWidgetHelp = onWidgetHelp,
                                 )
                             }
                         }
@@ -227,10 +248,12 @@ class MainActivity : ComponentActivity() {
                         StationArtwork(artHeight)
                         Spacer(Modifier.height(24.dp))
                         StationActions(
-                            configured = station != null,
+                            route = route,
+                            configured = configured,
                             canPinShortcut = canPinShortcut,
-                            onPrimary = if (station == null) ({ showSettings = true }) else onCall,
+                            onPrimary = onPrimary,
                             onPinShortcut = onPinShortcut,
+                            onWidgetHelp = onWidgetHelp,
                         )
                     }
                 }
@@ -240,6 +263,7 @@ class MainActivity : ComponentActivity() {
         if (showSettings) {
             StationSettings(
                 station = station,
+                needsDeviceId = route == CallRoute.DIRECT,
                 onDismiss = { showSettings = false },
                 onSave = { saved ->
                     onSaveStation(saved)
@@ -253,8 +277,8 @@ class MainActivity : ComponentActivity() {
             CallErrorDialog(
                 error = error,
                 onDismiss = { handoffError = null },
-                onGetYandex = {
-                    if (openHelp(YandexAppDownloadUrl)) handoffError = null
+                onGetSmartHome = {
+                    if (openHelp(SmartHomeDownloadUrl)) handoffError = null
                 },
                 onWidgetHelp = {
                     handoffError = null
@@ -318,8 +342,7 @@ private fun StationTitle(station: Station?) {
     )
     Spacer(Modifier.height(4.dp))
     Text(
-        text = if (station == null) "Настройте звонок на домашнюю колонку"
-        else "Звонок на Яндекс Станцию",
+        text = "Звонок на Яндекс Станцию",
         color = MaterialTheme.colorScheme.onSurfaceVariant,
         style = MaterialTheme.typography.bodyLarge,
     )
@@ -363,12 +386,25 @@ private fun StationArtwork(height: Dp, modifier: Modifier = Modifier) {
 
 @Composable
 private fun StationActions(
+    route: CallRoute,
     configured: Boolean,
     canPinShortcut: Boolean,
     onPrimary: () -> Unit,
     onPinShortcut: () -> Unit,
+    onWidgetHelp: () -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
+    val label = when (route) {
+        CallRoute.DIRECT -> if (configured) "Позвонить" else "Настроить прямой звонок"
+        CallRoute.SMART_HOME -> "Открыть «Дом с Алисой»"
+        CallRoute.UNAVAILABLE -> "Установить «Дом с Алисой»"
+    }
+    val guidance = when (route) {
+        CallRoute.DIRECT -> if (configured) "Передадим вызов приложению Яндекса"
+        else "Понадобится идентификатор Станции"
+        CallRoute.SMART_HOME -> "Затем нажмите трубку рядом со Станцией"
+        CallRoute.UNAVAILABLE -> "В нём можно звонить на Станцию"
+    }
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Button(
             onClick = onPrimary,
@@ -391,7 +427,7 @@ private fun StationActions(
             )
             Spacer(Modifier.width(12.dp))
             Text(
-                text = if (configured) "Позвонить" else "Настроить звонок",
+                text = label,
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
                 textAlign = TextAlign.Center,
@@ -399,14 +435,13 @@ private fun StationActions(
         }
         Spacer(Modifier.height(10.dp))
         Text(
-            text = if (configured) "Вызов откроется в приложении Яндекса"
-            else "Понадобится идентификатор Станции",
+            text = guidance,
             modifier = Modifier.padding(horizontal = 10.dp),
             color = colors.onSurfaceVariant,
             style = MaterialTheme.typography.bodyMedium,
             textAlign = TextAlign.Center,
         )
-        if (configured && canPinShortcut) {
+        if (route == CallRoute.DIRECT && configured && canPinShortcut) {
             Spacer(Modifier.height(8.dp))
             TextButton(
                 onClick = onPinShortcut,
@@ -420,6 +455,14 @@ private fun StationActions(
                 Spacer(Modifier.width(8.dp))
                 Text("Добавить ярлык на экран", textAlign = TextAlign.Center)
             }
+        } else if (route == CallRoute.SMART_HOME) {
+            Spacer(Modifier.height(8.dp))
+            TextButton(
+                onClick = onWidgetHelp,
+                modifier = Modifier.heightIn(min = 48.dp),
+            ) {
+                Text("Виджеты Яндекса", textAlign = TextAlign.Center)
+            }
         }
     }
 }
@@ -428,6 +471,7 @@ private fun StationActions(
 @Composable
 private fun StationSettings(
     station: Station?,
+    needsDeviceId: Boolean,
     onDismiss: () -> Unit,
     onSave: (Station) -> Unit,
     onWidgetHelp: () -> Unit,
@@ -435,14 +479,15 @@ private fun StationSettings(
     var name by rememberSaveable { mutableStateOf(station?.name ?: DefaultStationName) }
     var deviceId by rememberSaveable { mutableStateOf(station?.deviceId.orEmpty()) }
     var submitted by rememberSaveable { mutableStateOf(false) }
-    val invalidId = submitted && !isValidStationDeviceId(deviceId)
+    val validId = (!needsDeviceId && deviceId.isBlank()) || isValidStationDeviceId(deviceId)
+    val invalidId = submitted && !validId
     val keyboard = LocalSoftwareKeyboardController.current
 
     fun save() {
         submitted = true
-        if (isValidStationDeviceId(deviceId)) {
+        if (validId) {
             keyboard?.hide()
-            onSave(Station(name.trim().ifBlank { DefaultStationName }, deviceId.trim()))
+            onSave(Station(name.trim().ifBlank { DefaultStationName }, deviceId.trim().ifBlank { null }))
         }
     }
 
@@ -466,7 +511,11 @@ private fun StationSettings(
                 style = MaterialTheme.typography.headlineSmall,
             )
             Text(
-                text = "В «Доме с Алисой» откройте колонку → «Помощь» → «Об устройстве» и скопируйте идентификатор.",
+                text = if (needsDeviceId) {
+                    "В «Доме с Алисой» откройте колонку → «Помощь» → «Об устройстве» и скопируйте идентификатор."
+                } else {
+                    "Идентификатор нужен только для прямого вызова через совместимую версию Яндекса."
+                },
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodyMedium,
             )
@@ -521,7 +570,7 @@ private fun StationSettings(
 private fun CallErrorDialog(
     error: CallHandoffResult,
     onDismiss: () -> Unit,
-    onGetYandex: () -> Unit,
+    onGetSmartHome: () -> Unit,
     onWidgetHelp: () -> Unit,
     onSettings: () -> Unit,
 ) {
@@ -530,11 +579,11 @@ private fun CallErrorDialog(
     val action: String
     val onAction: () -> Unit
     when (error) {
-        CallHandoffResult.YANDEX_UNAVAILABLE -> {
-            title = "Нужно приложение Яндекса"
-            message = "Установите или обновите Яндекс, войдите в аккаунт Станции и повторите вызов."
+        CallHandoffResult.SMART_HOME_UNAVAILABLE -> {
+            title = "Нужен «Дом с Алисой»"
+            message = "Установите «Дом с Алисой» и войдите в аккаунт Станции. Для звонка нажмите трубку рядом с колонкой."
             action = "Открыть страницу"
-            onAction = onGetYandex
+            onAction = onGetSmartHome
         }
         CallHandoffResult.INVALID_DEVICE_ID, CallHandoffResult.STATION_NOT_CONFIGURED -> {
             title = "Проверьте идентификатор"
@@ -544,7 +593,7 @@ private fun CallErrorDialog(
         }
         CallHandoffResult.FAILED -> {
             title = "Не удалось открыть вызов"
-            message = "Попробуйте обновить приложение Яндекса. Позвонить также можно через его штатный виджет."
+            message = "Откройте «Дом с Алисой» и нажмите трубку рядом со Станцией."
             action = "О виджете"
             onAction = onWidgetHelp
         }

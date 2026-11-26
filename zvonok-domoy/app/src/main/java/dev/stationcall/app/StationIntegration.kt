@@ -10,7 +10,7 @@ import android.graphics.drawable.Icon
 import android.net.Uri
 import android.os.Bundle
 
-const val YandexAppDownloadUrl = "https://yandex.ru/yandexapp/"
+const val SmartHomeDownloadUrl = "https://ya.cc/iot_app"
 const val YandexWidgetHelpUrl = "https://alice.yandex.ru/support/ru/smart-home/widgets"
 const val CallStationShortcutAction = "dev.stationcall.app.CALL_STATION"
 const val ShortcutFailureExtra = "dev.stationcall.app.SHORTCUT_FAILURE"
@@ -19,69 +19,103 @@ private val deviceIdPattern = Regex("[A-Za-z0-9._~-]+")
 
 fun isValidStationDeviceId(value: String): Boolean = deviceIdPattern.matches(value.trim())
 
-data class Station(val name: String, val deviceId: String)
+data class Station(val name: String, val deviceId: String?)
 
 class StationRepository(context: Context) {
     private val preferences = context.getSharedPreferences("station", Context.MODE_PRIVATE)
 
     fun load(): Station? {
         val name = preferences.getString("name", null) ?: return null
-        val deviceId = preferences.getString("device_id", null) ?: return null
-        if (name.isBlank() || !isValidStationDeviceId(deviceId)) return null
+        val deviceId = preferences.getString("device_id", null)?.takeIf(::isValidStationDeviceId)
+        if (name.isBlank()) return null
         return Station(name, deviceId)
     }
 
     fun save(station: Station) {
-        require(station.name.isNotBlank() && isValidStationDeviceId(station.deviceId))
+        require(station.name.isNotBlank())
+        require(station.deviceId == null || isValidStationDeviceId(station.deviceId))
         preferences.edit()
             .putString("name", station.name.trim())
-            .putString("device_id", station.deviceId.trim())
+            .putString("device_id", station.deviceId?.trim())
             .apply()
-    }
-
-    fun clear() {
-        preferences.edit().clear().apply()
     }
 }
 
+enum class CallRoute { DIRECT, SMART_HOME, UNAVAILABLE }
+
 enum class CallHandoffResult {
     OPENED,
-    YANDEX_UNAVAILABLE,
+    SMART_HOME_UNAVAILABLE,
     INVALID_DEVICE_ID,
     STATION_NOT_CONFIGURED,
     FAILED,
 }
 
 object StationCall {
-    private val yandexPackages = listOf(
+    private const val smartHomePackage = "com.yandex.iot"
+    private const val sampleDeviceId = "station"
+    private val directCallPackages = listOf(
         "com.yandex.searchapp",
         "com.yandex.searchapp.beta",
         "ru.yandex.searchplugin",
     )
 
-    fun launch(context: Context, deviceId: String): CallHandoffResult {
-        if (!isValidStationDeviceId(deviceId)) return CallHandoffResult.INVALID_DEVICE_ID
+    fun route(context: Context, deviceId: String?): CallRoute = when {
+        directCallIntents(deviceId ?: sampleDeviceId).any {
+            it.resolveActivity(context.packageManager) != null
+        } -> CallRoute.DIRECT
+        smartHomeIntent(context) != null -> CallRoute.SMART_HOME
+        else -> CallRoute.UNAVAILABLE
+    }
 
-        // Preserve the nested URI format used by the community-documented Android handoff.
+    fun launch(context: Context, deviceId: String?): CallHandoffResult {
+        if (deviceId != null && !isValidStationDeviceId(deviceId)) {
+            return CallHandoffResult.INVALID_DEVICE_ID
+        }
+
+        if (deviceId != null && directCallIntents(deviceId).any { tryOpen(context, it) }) {
+            return CallHandoffResult.OPENED
+        }
+
+        val home = smartHomeIntent(context)
+        if (home != null) {
+            return if (tryOpen(context, home)) CallHandoffResult.OPENED else CallHandoffResult.FAILED
+        }
+        return when (route(context, deviceId)) {
+            CallRoute.DIRECT -> if (deviceId == null) {
+                CallHandoffResult.STATION_NOT_CONFIGURED
+            } else {
+                CallHandoffResult.FAILED
+            }
+            CallRoute.SMART_HOME -> CallHandoffResult.FAILED
+            CallRoute.UNAVAILABLE -> CallHandoffResult.SMART_HOME_UNAVAILABLE
+        }
+    }
+
+    private fun smartHomeIntent(context: Context): Intent? =
+        context.packageManager.getLaunchIntentForPackage(smartHomePackage)
+            ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+
+    private fun directCallIntents(deviceId: String): List<Intent> {
+        // Keep the legacy link limited to the Yandex search apps that may handle it.
         val link = Uri.parse(
             "ya-search-app-open://path?uri=messenger://call/create/private?device_id=${deviceId.trim()}",
         )
-        val intent = Intent(Intent.ACTION_VIEW, link).apply {
-            addCategory(Intent.CATEGORY_BROWSABLE)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        return directCallPackages.map { packageName ->
+            Intent(Intent.ACTION_VIEW, link)
+                .addCategory(Intent.CATEGORY_BROWSABLE)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                .setPackage(packageName)
         }
+    }
 
-        for (packageName in yandexPackages) {
-            try {
-                context.startActivity(intent.setPackage(packageName))
-                return CallHandoffResult.OPENED
-            } catch (_: ActivityNotFoundException) {
-                // The installed edition may use another package name.
-            } catch (_: SecurityException) {
-                return CallHandoffResult.FAILED
-            }
-        }
-        return CallHandoffResult.YANDEX_UNAVAILABLE
+    private fun tryOpen(context: Context, intent: Intent): Boolean = try {
+        context.startActivity(intent)
+        true
+    } catch (_: ActivityNotFoundException) {
+        false
+    } catch (_: SecurityException) {
+        false
     }
 }
 
@@ -115,8 +149,7 @@ class StationShortcutActivity : Activity() {
 
         if (savedInstanceState == null && intent.action == CallStationShortcutAction) {
             val station = StationRepository(this).load()
-            val result = station?.let { StationCall.launch(this, it.deviceId) }
-                ?: CallHandoffResult.STATION_NOT_CONFIGURED
+            val result = StationCall.launch(this, station?.deviceId)
 
             if (result != CallHandoffResult.OPENED) {
                 val main = Intent(this, MainActivity::class.java).apply {

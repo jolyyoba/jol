@@ -1,5 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <queries>
+        <package android:name="com.yandex.iot" />
+        <package android:name="com.yandex.searchapp" />
+        <package android:name="com.yandex.searchapp.beta" />
+        <package android:name="ru.yandex.searchplugin" />
+    </queries>
     <application
         android:allowBackup="false"
         android:icon="@drawable/ic_station_launcher"
